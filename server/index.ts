@@ -5,11 +5,11 @@ import * as fs from "fs";
 import * as path from "path";
 import { loadEnvFile } from "node:process";
 
-// Try to load .env file
+// Try to load .env file (local only)
 try {
   loadEnvFile(path.resolve(process.cwd(), ".env"));
 } catch (e) {
-  // .env might not exist or loadEnvFile not supported
+  // .env might not exist on Vercel
 }
 
 const app = express();
@@ -21,42 +21,24 @@ declare module "http" {
   }
 }
 
+/* ================= CORS ================= */
+
 function setupCors(app: express.Application) {
   app.use((req, res, next) => {
-    const origins = new Set<string>();
-
-    if (process.env.REPLIT_DEV_DOMAIN) {
-      origins.add(`https://${process.env.REPLIT_DEV_DOMAIN}`);
-    }
-
-    if (process.env.REPLIT_DOMAINS) {
-      process.env.REPLIT_DOMAINS.split(",").forEach((d) => {
-        origins.add(`https://${d.trim()}`);
-      });
-    }
-
     const origin = req.header("origin");
 
-    // Allow development origins and always allow requests without an origin (like native apps)
     const isInternal =
-      !origin || // Native apps often don't send Origin
+      !origin ||
       origin?.startsWith("http://localhost:") ||
-      origin?.startsWith("http://127.0.0.1:") ||
-      origin?.includes(".railway.app") ||
-      (origin && /^http:\/\/(\d{1,3}\.){3}\d{1,3}/.test(origin));
+      origin?.startsWith("http://127.0.0.1:");
 
-    if (origins.has(origin || "") || isInternal) {
+    if (isInternal) {
       res.header("Access-Control-Allow-Origin", origin || "*");
       res.header(
         "Access-Control-Allow-Methods",
-        "GET, POST, PUT, DELETE, OPTIONS",
+        "GET, POST, PUT, DELETE, OPTIONS"
       );
       res.header("Access-Control-Allow-Headers", "Content-Type");
-
-      // Only set credentials for specific origins
-      if (origin && origin !== "*") {
-        res.header("Access-Control-Allow-Credentials", "true");
-      }
     }
 
     if (req.method === "OPTIONS") {
@@ -67,198 +49,113 @@ function setupCors(app: express.Application) {
   });
 }
 
+/* ================= BODY PARSER ================= */
+
 function setupBodyParsing(app: express.Application) {
   app.use(
     express.json({
       verify: (req, _res, buf) => {
         req.rawBody = buf;
       },
-    }),
+    })
   );
 
   app.use(express.urlencoded({ extended: false }));
 }
 
+/* ================= LOGGING ================= */
+
 function setupRequestLogging(app: express.Application) {
   app.use((req, res, next) => {
     const start = Date.now();
-    const path = req.path;
-    let capturedJsonResponse: Record<string, unknown> | undefined = undefined;
-
-    const originalResJson = res.json;
-    res.json = function (bodyJson, ...args) {
-      capturedJsonResponse = bodyJson;
-      return originalResJson.apply(res, [bodyJson, ...args]);
-    };
 
     res.on("finish", () => {
-      if (!path.startsWith("/api")) return;
+      if (!req.path.startsWith("/api")) return;
 
       const duration = Date.now() - start;
-
-      let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
-      if (capturedJsonResponse) {
-        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
-      }
-
-      if (logLine.length > 80) {
-        logLine = logLine.slice(0, 79) + "…";
-      }
-
-      log(logLine);
+      log(`${req.method} ${req.path} ${res.statusCode} in ${duration}ms`);
     });
 
     next();
   });
 }
 
+/* ================= LANDING PAGE ================= */
+
 function getAppName(): string {
   try {
-    const appJsonPath = path.resolve(process.cwd(), "app.json");
-    const appJsonContent = fs.readFileSync(appJsonPath, "utf-8");
-    const appJson = JSON.parse(appJsonContent);
+    const appJson = JSON.parse(
+      fs.readFileSync(path.resolve(process.cwd(), "app.json"), "utf-8")
+    );
     return appJson.expo?.name || "App Landing Page";
   } catch {
     return "App Landing Page";
   }
 }
 
-function serveExpoManifest(platform: string, res: Response) {
-  const manifestPath = path.resolve(
+function serveLandingPage(req: Request, res: Response) {
+  const templatePath = path.resolve(
     process.cwd(),
-    "static-build",
-    platform,
-    "manifest.json",
+    "server",
+    "templates",
+    "landing-page.html"
   );
 
-  if (!fs.existsSync(manifestPath)) {
-    return res
-      .status(404)
-      .json({ error: `Manifest not found for platform: ${platform}` });
+  if (!fs.existsSync(templatePath)) {
+    return res.status(404).send("Landing page not found");
   }
 
-  res.setHeader("expo-protocol-version", "1");
-  res.setHeader("expo-sfv-version", "0");
-  res.setHeader("content-type", "application/json");
+  const template = fs.readFileSync(templatePath, "utf-8");
+  const appName = getAppName();
 
-  const manifest = fs.readFileSync(manifestPath, "utf-8");
-  res.send(manifest);
-}
-
-function serveLandingPage({
-  req,
-  res,
-  landingPageTemplate,
-  appName,
-}: {
-  req: Request;
-  res: Response;
-  landingPageTemplate: string;
-  appName: string;
-}) {
-  const forwardedProto = req.header("x-forwarded-proto");
-  const protocol = forwardedProto || req.protocol || "https";
-  const forwardedHost = req.header("x-forwarded-host");
-  const host = forwardedHost || req.get("host");
+  const protocol = req.headers["x-forwarded-proto"] || req.protocol;
+  const host = req.headers["x-forwarded-host"] || req.get("host");
   const baseUrl = `${protocol}://${host}`;
-  const expsUrl = `${host}`;
 
-  log(`baseUrl`, baseUrl);
-  log(`expsUrl`, expsUrl);
-
-  const html = landingPageTemplate
-    .replace(/BASE_URL_PLACEHOLDER/g, baseUrl)
-    .replace(/EXPS_URL_PLACEHOLDER/g, expsUrl)
+  const html = template
+    .replace(/BASE_URL_PLACEHOLDER/g, baseUrl as string)
     .replace(/APP_NAME_PLACEHOLDER/g, appName);
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.status(200).send(html);
 }
 
-function configureExpoAndLanding(app: express.Application) {
-  const templatePath = path.resolve(
-    process.cwd(),
-    "server",
-    "templates",
-    "landing-page.html",
-  );
-  const landingPageTemplate = fs.readFileSync(templatePath, "utf-8");
-  const appName = getAppName();
-
-  log("Serving static Expo files with dynamic manifest routing");
-
-  app.use((req: Request, res: Response, next: NextFunction) => {
-    if (req.path.startsWith("/api")) {
-      return next();
-    }
-
-    if (req.path !== "/" && req.path !== "/manifest") {
-      return next();
-    }
-
-    const platform = req.header("expo-platform");
-    if (platform && (platform === "ios" || platform === "android")) {
-      return serveExpoManifest(platform, res);
-    }
-
-    if (req.path === "/") {
-      return serveLandingPage({
-        req,
-        res,
-        landingPageTemplate,
-        appName,
-      });
-    }
-
-    next();
+function configureLanding(app: express.Application) {
+  app.get("/", (req, res) => {
+    serveLandingPage(req, res);
   });
-
-  app.use("/assets", express.static(path.resolve(process.cwd(), "assets")));
-  app.use(express.static(path.resolve(process.cwd(), "static-build")));
-
-  log("Expo routing: Checking expo-platform header on / and /manifest");
 }
 
+/* ================= ERROR HANDLER ================= */
+
 function setupErrorHandler(app: express.Application) {
-  app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
-    const error = err as {
-      status?: number;
-      statusCode?: number;
-      message?: string;
-    };
-
-    const status = error.status || error.statusCode || 500;
-    const message = error.message || "Internal Server Error";
-
+  app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
     console.error("Internal Server Error:", err);
 
     if (res.headersSent) {
       return next(err);
     }
 
-    return res.status(status).json({ message });
+    res.status(err.status || 500).json({
+      message: err.message || "Internal Server Error",
+    });
   });
 }
 
-(async () => {
-  setupCors(app);
-  setupBodyParsing(app);
-  setupRequestLogging(app);
+/* ================= INITIALIZE APP ================= */
 
-  configureExpoAndLanding(app);
+setupCors(app);
+setupBodyParsing(app);
+setupRequestLogging(app);
+configureLanding(app);
 
-  const server = await registerRoutes(app);
+// Register API routes
+registerRoutes(app).catch((err) => {
+  console.error("Route registration failed:", err);
+});
 
-  setupErrorHandler(app);
+setupErrorHandler(app);
 
-  const port = parseInt(process.env.PORT || "5001", 10);
-  server.listen(
-    {
-      port,
-      host: "0.0.0.0",
-    },
-    () => {
-      log(`express server serving on port ${port}`);
-    },
-  );
-})();
+/* ================= EXPORT FOR VERCEL ================= */
+
+export default app;
